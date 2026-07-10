@@ -1,0 +1,825 @@
+# isoreader2 specific implementation ==========
+
+#' Aggregate data from isofiles
+#'
+#' This function allows dynamic aggregation and validation of data read by [ir_read_isofiles()]. Like [ir_read_isofiles()], it is designed to be fail save by safely catching errors and reporting back on them (see [ir_get_problems()]). This function should work out of the box for most files without additional modification of the `aggregator`.
+#'
+#' @param isofiles the isotope data files/archives read in by [ir_read_isofiles()]
+#' @param aggregator typically the name of a registered aggregator (see all with `ir_get_option("aggregators")`),
+#' default is the "standard" aggregator included in the package (`ir_get_aggregator("standard")`).
+#' The other built-in options, from smallest to largest, are "metadata" (`ir_get_aggregator("metadata")`, metadata only),
+#' "minimal" (`ir_get_aggregator("minimal")`, metadata plus the core data series), and
+#' "extended" (`ir_get_aggregator("extended")`, also resistors and the vendor data table).
+#' The `aggregator` parameter can can also directly be an aggregator tibble (created/modified with [ir_start_aggregator()]
+#' and/or [ir_add_to_aggregator()]) that defines which data should be aggregated and how.
+#' @param intensity_units target intensity unit to convert traces/cycles/scans to before aggregation,
+#' one of `"mV"`, `"V"`, `"fA"`, `"pA"`, `"nA"`, `"\u00b5A"`, `"mA"`, `"A"`, `"cps"`.
+#' Only applied when the aggregator includes any of those datasets. Default is `"mV"`.
+#' @inheritParams ir_read_isofiles
+#' @return a list of merged dataframes collected from the `isofiles` based on the `aggregator` definitions
+#' @export
+ir_aggregate_isofiles <- function(
+  isofiles,
+  intensity_units = c("mV", "V", "fA", "pA", "nA", "\u00b5A", "mA", "A", "cps"),
+  aggregator = "standard",
+  show_progress = is_interactive(),
+  show_problems = TRUE
+) {
+  # safety checks
+  if (!missing(isofiles) && is.character(isofiles)) {
+    cli_abort(
+      c(
+        "argument {.field isofiles} must be a collection of isofiles, not a character vector of file paths",
+        "i" = "did you mean to run {.strong ir_read_isofiles()} on {qty(length(isofiles))}{?this path/these paths} first?"
+      )
+    )
+  }
+  isofiles |>
+    check_arg(
+      !missing(isofiles) && is(isofiles, "ir_isofiles"),
+      "must be a collection of isofiles (use ir_read_isofiles())"
+    )
+  aggregator |>
+    check_arg(
+      is_scalar_character(aggregator) || is(aggregator, "ir_aggregator"),
+      "must be a valid aggregator"
+    )
+  if (is.character(aggregator)) {
+    aggregator <- ir_get_aggregator(aggregator)
+  }
+
+  # intensity_units validation
+  if (missing(intensity_units)) {
+    intensity_units <- "mV"
+  }
+  intensity_units <- arg_match(intensity_units)
+
+  agg_data <-
+    aggregate_files(
+      isofiles,
+      aggregator,
+      intensity_units = intensity_units,
+      show_progress = show_progress,
+      show_problems = show_problems
+    )
+  # drop any aggregated dataset that ended up with no columns
+  agg_data <- drop_empty_datasets(agg_data)
+  class(agg_data) <- unique(c("ir_aggregated_data"), class(agg_data))
+  return(agg_data)
+}
+
+# remove aggregated datasets that ended up with no columns (ncol == 0)
+drop_empty_datasets <- function(agg_data) {
+  agg_data[
+    !purrr::map_lgl(agg_data, \(x) is.data.frame(x) && ncol(x) == 0)
+  ]
+}
+
+#' Combine aggregated isofile data
+#'
+#' Combine multiple [ir_aggregate_isofiles()] results into a single
+#' `ir_aggregated_data` object by row-binding each of the contained datasets
+#' (`metadata`, `traces`, `cycles`, `scans`, `resistors`, `vendor_data_table`,
+#' `problems`, ...) with [dplyr::bind_rows()]. Datasets present in only some of
+#' the objects are combined as well (missing columns are filled with `NA`). The
+#' file index `uidx` is re-numbered across the inputs so each file stays uniquely
+#' identified (and its datasets stay correctly linked) in the combined object.
+#' @param ... `ir_aggregated_data` objects to combine
+#' @return a single combined `ir_aggregated_data` object
+#' @export
+c.ir_aggregated_data <- function(...) {
+  objs <- list(...)
+  # all inputs must be aggregated data
+  if (!all(purrr::map_lgl(objs, ~ is(.x, "ir_aggregated_data")))) {
+    cli_abort(
+      "all objects to combine must be {.cls ir_aggregated_data} (from ir_aggregate_isofiles())"
+    )
+  }
+
+  # offset each object's uidx so files stay uniquely identified after binding
+  uidx_offset <- 0L
+  objs <- purrr::map(objs, function(obj) {
+    uidx_vals <- purrr::map(obj, function(ds) {
+      if (is.data.frame(ds) && "uidx" %in% names(ds)) ds$uidx
+    }) |>
+      unlist(use.names = FALSE)
+    max_uidx <- if (length(uidx_vals) > 0) max(uidx_vals, na.rm = TRUE) else 0L
+    obj <- purrr::map(obj, function(ds) {
+      if (is.data.frame(ds) && "uidx" %in% names(ds)) {
+        ds$uidx <- ds$uidx + uidx_offset
+      }
+      ds
+    })
+    uidx_offset <<- uidx_offset + max_uidx
+    obj
+  })
+
+  # row-bind each dataset across all objects (union of dataset names)
+  dataset_names <- objs |> purrr::map(names) |> unlist() |> unique()
+  combined <- dataset_names |>
+    purrr::map(function(nm) {
+      dplyr::bind_rows(purrr::map(objs, ~ .x[[nm]]))
+    }) |>
+    setNames(dataset_names)
+
+  class(combined) <- "ir_aggregated_data"
+  return(combined)
+}
+
+# aggregator `cast` that keeps already-typed values as-is: character and integer
+# columns are returned unchanged, everything else is coerced to numeric. Useful
+# for aggregating datasets whose columns are already correctly typed by the
+# reader (e.g. the `vendor_data_table`, with its dynamically named numeric
+# columns plus a few string/integer ones), where the only goal of casting is to
+# normalise stragglers (e.g. a column that ended up all-NA/logical) to numeric.
+keep_as_is <- function(x) {
+  if (is.character(x) || is.integer(x)) {
+    x
+  } else {
+    as.numeric(x)
+  }
+}
+
+# design aggregators (general) ========
+
+# helper function to turn something into an aggregator tibble
+as_aggregator <- function(x, name = attr(x, "name")) {
+  attr(x, "name") <- name
+  class(x) <- unique(c("ir_aggregator", class(x)))
+  return(x)
+}
+
+#' Dynamic data aggregator
+#'
+#' These functions allow definition of custom data aggregators for processing data extracted from isofiles. An aggregator is run on each imported file and pulls together the relevant data users are interested in while making sure data formats are correct so that the aggregated data can be merged across several imported files for fast downstream processing.
+#'
+#' @param name a descriptive name for the aggregator. This name is automatically used as the default name when registering the aggregator via [ir_register_aggregator()].
+#' @return an aggregator tibble
+#' @describeIn ir_aggregator starts the aggregator
+#' @export
+ir_start_aggregator <- function(name) {
+  check_arg(
+    name,
+    !missing(name) && is_scalar_character(name),
+    "must be a string"
+  )
+  tibble(
+    dataset = character(),
+    column = character(),
+    source = list(),
+    default = list(),
+    regexp = logical(),
+    cast = character(),
+    func = character(),
+    args = list()
+  ) |>
+    as_aggregator(name = name)
+}
+
+# add to aggregator
+#' @param aggregator the aggregator table generated by [ir_start_aggregator()] or passed from a previous call to [ir_add_to_aggregator()] for constructing the entire aggregator by piping
+#' @param dataset the name of the dataset to aggregate from, by default "metadata" which is by far the most common aggregator to work with
+#' @param column the name of the column in which data should be stored
+#' @param source single character column name or vector of column names (if alternatives could be the source) where in the `dataset` to find data for the `column`. If a vector of multiple column names is provided (e.g. `source = c("a1", "a2")`), the first column name that's found during processing of a dataset will be used and passed to the function defined in `func` (if any) and then the one defined in `cast`. To provide multiple parameters from the data to `func`, define a list instead of a vector `source = list("a", "b", "c")` or if multiple alternative columns can be the source for any of the arguments, define as `source = list(c("a1", "a2"), "b", c("c1", "c2", "c3"))`
+#' @param default the default value if no `source` columns can be found or another error is encountered during aggregation. Note that the `default` value will also be processed with the function in `cast` to make sure it has the correct data type.
+#' @param cast what to cast the values of the resulting column to, most commonly `"as.character"`, `"as.integer"`, `"as.numeric"`, or `"as.factor"`. This is required to ensure all aggregated values have the correct data type.
+#' @param regexp whether source column names should be interpreted as a regular expressions for the purpose of finding the relevant column(s). Note if `regexp = TRUE`, the search for the source column always becomes case-insensitive so this can also be used for a direct match of a source column whose upper/lower casing can be unreliable. If a column is matched by a regexp and also by a direct aggregator rule, the direct aggregator rule takes precedence.
+#' @param func name of a processing function to apply before casting the value with the `cast` function. This is optional and can be used to conduct more elaborate preprocessing of a data or combining data from multiple source columns in the correct way (e.g. pasting together from multiple columns).
+#' @param args an optional list of arguments to pass to the `func` in addition to the values coming from the source column(s)
+#' @describeIn ir_aggregator add additional column to aggregate data for. Overwrites an existing aggregator entry for the same dataset and column if it already exists.
+#' @export
+ir_add_to_aggregator <- function(
+  aggregator,
+  dataset = c(
+    "metadata",
+    "traces",
+    "cycles",
+    "scans",
+    "resistors",
+    "vendor_data_table"
+  ),
+  column,
+  source = column,
+  default = NA,
+  cast = "as.character",
+  regexp = FALSE,
+  func = NULL,
+  args = NULL
+) {
+  # safety checks
+  check_arg(
+    aggregator,
+    !missing(aggregator) &&
+      is_tibble(aggregator) &&
+      is(aggregator, "ir_aggregator"),
+    format_inline("must be an {cli::col_magenta('ir_aggregator')} tibble")
+  )
+  # default
+  if (missing(dataset)) {
+    dataset <- "metadata"
+  }
+  dataset |> check_arg(is_scalar_character(dataset), "must be a string")
+  dataset <- arg_match(dataset)
+  check_arg(
+    column,
+    !missing(column) && is_scalar_character(column),
+    "must be a string"
+  )
+  check_arg(
+    source,
+    is_character(source) || is_list(source),
+    "must be a character vector or list"
+  )
+  check_arg(
+    regexp,
+    is_scalar_logical(regexp),
+    "must be TRUE or FALSE"
+  )
+  check_arg(cast, is_scalar_character(cast), "must be a string")
+  check_arg(
+    func,
+    is.null(func) || is_scalar_character(func),
+    "- if provided - must be a string"
+  )
+  check_arg(
+    args,
+    is.null(args) || is_list(args),
+    "- if provided - must be a list"
+  )
+
+  # make surce source is a list
+  if (!is.list(source)) {
+    source <- list(source)
+  }
+
+  # function checks - pkg::func not supported yet (e.g. forcats::as_factor)! need to load the namespace, solution needed?
+  if (!exists(cast, mode = "function")) {
+    cli_abort("function {.fn {cast}} could not be found")
+  }
+  if (!is.null(func) && !exists(func, mode = "function")) {
+    cli_abort("function {.fn {func}} could not be found")
+  }
+
+  # check if default evaluates without error to avoid unexpected/uncaught errors later on
+  do.call(cast, args = list(default))
+
+  aggregator |>
+    # overwrite existing if there are any
+    dplyr::filter(!(dataset == !!dataset & column == !!column)) |>
+    # add new
+    dplyr::bind_rows(
+      tibble(
+        dataset = dataset,
+        column = column,
+        source = list(source),
+        default = list(default),
+        regexp = regexp,
+        cast = cast,
+        func = if (!is.null(func)) func else NA_character_,
+        args = if (!is.null(args)) list(args) else list(NULL)
+      )
+    ) |>
+    # make sure it's an aggregator
+    as_aggregator()
+}
+
+# register an aggregator
+#' @describeIn ir_aggregator register an aggregator in the isoreader2 options so it can be retrieved with [ir_get_aggregator()]
+#' @export
+ir_register_aggregator <- function(
+  aggregator,
+  name = attr(aggregator, "name")
+) {
+  # checks
+  check_arg(
+    aggregator,
+    !missing(aggregator) &&
+      is_tibble(aggregator) &&
+      is(aggregator, "ir_aggregator"),
+    format_inline("must be an {cli::col_magenta('ir_aggregator')} tibble")
+  )
+  check_arg(name, is_scalar_character(name), "must be a string")
+  aggs <- ir_get_option("aggregators")
+  aggs[[name]] <- as_aggregator(aggregator, name = name)
+  ir_options(list(aggregators = aggs))
+  # return invisibly for piping
+  return(invisible(aggregator))
+}
+
+# retrieve a registered aggregator
+#' @describeIn ir_aggregator retrieve a registered aggregator (get all aggregators with `ir_get_option("aggregators")`)
+#' @export
+ir_get_aggregator <- function(name) {
+  # safety checks
+  check_arg(
+    name,
+    !missing(name) && is_scalar_character(name),
+    "must be a string"
+  )
+  aggs <- ir_get_option("aggregators")
+  if (!name %in% names(aggs)) {
+    cli_abort(c(
+      "{.emph {.strong {name}}} is not a registered aggregator",
+      "i" = "available aggregator{?s}: {.emph {.strong {names(aggs)}}}"
+    ))
+  }
+  return(aggs[[name]])
+}
+
+# summarize the aggregator this way
+summarize_aggregator <- function(aggregator) {
+  if (nrow(aggregator) == 0) {
+    return(
+      aggregator |>
+        dplyr::mutate(
+          value = character(0),
+          default = character(0)
+        )
+    )
+  }
+
+  # generate text descriptor for the value
+  generate_value_descriptor <- function(source, cast, regexp, func, args) {
+    sources <- purrr::map(
+      source,
+      ~ {
+        if (regexp) {
+          # pseudo code (all_matches doesn't exist)
+          expr(all_matches(!!.x[[1]]))
+        } else if (length(.x) > 1) {
+          # pseudo code (one_of doesn't exist)
+          expr(one_of(!!!syms(.x)))
+        } else {
+          expr(!!sym(.x))
+        }
+      }
+    )
+
+    if (!is.na(func)) {
+      # with function
+      args <- c(sources, args)
+      expr <- rlang::expr((!!cast)((!!func)(!!!args)))
+    } else {
+      # without funtion
+      expr <- rlang::expr((!!cast)(!!sources[[1]]))
+    }
+    return(expr_text(expr))
+  }
+
+  # generate text descriptor for default
+  generate_default_descriptor <- function(default, cast) {
+    if (is.na(default[[1]])) {
+      return(NA_character_)
+    }
+    expr <- rlang::expr((!!cast)(!!default[[1]]))
+    return(expr_text(expr))
+  }
+
+  # summarize
+  aggregator |>
+    dplyr::mutate(
+      value = purrr::pmap_chr(
+        list(
+          .data$source,
+          .data$cast,
+          .data$regexp,
+          .data$func,
+          .data$args
+        ),
+        generate_value_descriptor
+      ),
+      default = purrr::map2_chr(
+        .data$default,
+        .data$cast,
+        generate_default_descriptor
+      )
+    )
+}
+
+# aggregate data (general) ========
+
+# aggregate data from multiple files
+# note that this function is pretty universal
+aggregate_files <- function(
+  isofiles,
+  aggregator,
+  intensity_units,
+  show_progress = is_interactive(),
+  show_problems = TRUE,
+  call = rlang::caller_call()
+) {
+  # keep track of current env to anchor progress bars
+  root_env <- current_env()
+
+  # safety checks
+  files_req_cols <- "file_path"
+  check_tibble(isofiles, files_req_cols)
+  check_arg(
+    aggregator,
+    !missing(aggregator) &&
+      is_tibble(aggregator) &&
+      is(aggregator, "ir_aggregator"),
+    format_inline("must be an {cli::col_magenta('ir_aggregator')} tibble")
+  )
+  if (nrow(isofiles) == 0) {
+    cli_abort("there is nothing to aggregate, {.var isofiles} has 0 rows")
+  }
+
+  # get started
+  start <- Sys.time()
+
+  # info
+  start <- start_info(
+    "is aggregating data from isofile {pb_current}/{pb_total - 1} using {.emph {.strong {attr(aggregator, 'name')}}} aggregator {pb_bar} ",
+    "| {pb_elapsed} | ETA{pb_eta} | {.file {pb_status}}",
+    pb_total = nrow(isofiles) + 1L,
+    pb_status = "",
+    show_progress = show_progress,
+    .call = call,
+    .env = root_env
+  )
+
+  # aggregate files safely and with progress info
+  aggregate_safely_with_progress <- function(file_path, uidx) {
+    # progress
+    if (!is.null(start$pb)) {
+      cli_progress_update(
+        id = start$pb,
+        status = basename(file_path),
+        force = TRUE,
+        .envir = root_env
+      )
+    }
+
+    # start timer
+    file_start <- start_info()
+
+    # read file but catch errors in case there are any uncaught ones
+    out <-
+      try_catch_cnds(
+        aggregate_data(
+          uidx = uidx,
+          datasets = isofiles[uidx, ] |> unlist(recursive = FALSE),
+          aggregator = aggregator,
+          intensity_units = intensity_units,
+          show_problems = FALSE # show them later
+        ),
+        error_value = list(
+          metadata = list(),
+          problems = tibble()
+        ),
+        catch_errors = !ir_get_option("debug")
+      )
+
+    # add file_path to metadata
+    out$result$metadata <- c(
+      # uidx is already in the dataset but faster to just add it in again
+      list(uidx = uidx, file_path = file_path),
+      out$result$metadata[
+        !names(out$result$metadata) %in% c("uidx", "file_path")
+      ]
+    )
+
+    # merge old, returned, and caught problems
+    problems <- dplyr::bind_rows(out$result$problems, out$conditions) |>
+      dplyr::mutate(new = TRUE)
+    out$result$problems <- isofiles$problems[[uidx]] |>
+      dplyr::bind_rows(problems) |>
+      dplyr::mutate(uidx = !!uidx) |>
+      dplyr::relocate("uidx", .before = 1L)
+
+    if (show_problems && nrow(problems) > 0) {
+      # info
+      finish_info(
+        format_inline("tried to aggregate {.file {basename(file_path)}}"),
+        start = file_start,
+        conditions = problems,
+        show_conditions = show_problems,
+        .call = call,
+        .env = root_env
+      )
+    }
+
+    # return
+    return(out$result)
+  }
+
+  # read files (separate calls to simplify backtraces)
+  results <- isofiles$file_path |>
+    purrr::map2(seq_len(nrow(isofiles)), aggregate_safely_with_progress)
+
+  # unused columns (this is purely for information purpses)
+  fetch_unused_columns <- function(result, dataset) {
+    if (dataset %in% names(attr(result, "unused_columns"))) {
+      attr(result, "unused_columns")[[dataset]]
+    } else {
+      character(0)
+    }
+  }
+
+  # combine results
+  datasets <- c(unique(aggregator$dataset), "problems")
+  fetch_dataset <- function(result, dataset) {
+    if (dataset %in% names(result)) {
+      result[[dataset]]
+    } else {
+      NULL
+    }
+  }
+  results <-
+    as.list(datasets) |>
+    setNames(datasets) |>
+    purrr::map(
+      ~ {
+        data <- purrr::map(results, fetch_dataset, .x) |>
+          dplyr::bind_rows()
+        unused_cols <- purrr::map(results, fetch_unused_columns, .x) |>
+          unlist(recursive = TRUE) |>
+          unique()
+        attr(data, "unused_columns") <- unused_cols
+        data
+      }
+    )
+
+  # info
+  has_data <- purrr::map_lgl(results, ~ ncol(.x) > 0)
+  data_series <- c("traces", "scans", "cycles")
+  n_rows <- purrr::map_int(results[has_data], nrow) |> numbers_to_text()
+  details <- sprintf(
+    "{cli::col_blue('%s')} (%s%s)",
+    names(results)[has_data],
+    n_rows,
+    ifelse(
+      names(results)[has_data] %in% data_series,
+      sprintf(
+        ", {.field intensity} in {cli::col_magenta('%s')}",
+        intensity_units
+      ),
+      ""
+    )
+  ) |>
+    purrr::map_chr(format_inline)
+  new_problems <- results$problems |>
+    dplyr::filter(!is.na(.data$new) & .data$new)
+  finish_info(
+    "aggregated {utils::head(details, -1)} from {nrow(isofiles)} file{?s} using the {.emph {.strong {attr(aggregator, 'name')}}} aggregator ",
+    if (nrow(new_problems) > 0) {
+      # custom problems summary
+      summarize_cnds(
+        new_problems,
+        include_symbol = FALSE,
+        include_call = FALSE,
+        summary_format = "but encountered {issues} {symbol$arrow_right} check with {.strong ir_get_problems(x)}"
+      )
+    },
+    success_format = if (nrow(new_problems) > 0) {
+      "{cli::col_yellow('!')} {msg}"
+    } else {
+      "{cli::col_green(symbol$tick)} {msg}"
+    },
+    start = start,
+    .call = call
+  )
+
+  # clean up problems
+  results$problems <- dplyr::select(results$problems, -"new")
+
+  # return
+  return(results)
+}
+
+# actual aggregation function
+# note that this function is pretty universal
+aggregate_data <- function(
+  uidx,
+  datasets,
+  aggregator,
+  intensity_units,
+  show_problems = TRUE
+) {
+  # don't process datasets that are not part of the data (NULL or empty tibble)
+  missing <- setdiff(
+    unique(aggregator$dataset),
+    names(datasets)[purrr::map_lgl(datasets, ~ !is.null(.x) && nrow(.x) > 0L)]
+  )
+  aggregator <- aggregator |> dplyr::filter(!.data$dataset %in% missing)
+  if (nrow(aggregator) == 0) {
+    cli_abort("there is nothing to aggregate")
+  }
+
+  # intensity conversion (non-standard pre-aggregation step)
+  # converts time-series datasets in place before column discovery so that
+  # find_source_columns sees the target intensity column name, not the raw one
+  conversion_cnds <- empty_cnds_tibble()
+  for (ds in intersect(
+    unique(aggregator$dataset),
+    c("traces", "scans", "cycles")
+  )) {
+    if (!is.null(datasets[[ds]]) && nrow(datasets[[ds]]) > 0L) {
+      converted <-
+        ir_convert_intensity(
+          datasets[[ds]],
+          resistors = datasets$resistors,
+          units = intensity_units
+        ) |>
+        try_catch_cnds(
+          # when the conversion fails, we'll keep the rest but not the intensity --> ends up as NAs
+          error_value = datasets[[ds]] |>
+            dplyr::select(-dplyr::starts_with("intensity."))
+        )
+      datasets[[ds]] <- converted$result
+      conversion_cnds <- dplyr::bind_rows(conversion_cnds, converted$conditions)
+    }
+  }
+
+  # find source columns and deal with any regexps that need to be resolved
+  # shouldn't throw errors relevant for user so not run with try_catch_cnds
+  all_columns <- purrr::map(datasets, names)
+  find_source_columns <- function(dataset, column, source, regexp) {
+    # find source columns
+    available_cols <- all_columns[[dataset]]
+    # find by regexp
+    if (regexp && length(source) > 0) {
+      sources <- grep(
+        source[[1]],
+        available_cols,
+        value = TRUE,
+        ignore.case = TRUE,
+        perl = TRUE
+      )
+      if (length(sources) > 0) {
+        # found some matching regexps
+        columns <- gsub(
+          source[[1]],
+          column,
+          sources,
+          ignore.case = TRUE,
+          perl = TRUE
+        )
+        sources <- as.list(sources)
+      } else {
+        # none found
+        columns <- c()
+        sources <- list(NULL)
+      }
+    } else if (length(source) > 0) {
+      # direct matches
+      columns <- column
+      sources <- purrr::map(
+        source,
+        ~ {
+          matches <- intersect(.x, available_cols)
+          if (length(matches) > 0) {
+            return(matches[1])
+          }
+          return(NULL)
+        }
+      )
+      # no source columns found for same parameters -> can't use
+      if (any(lengths(sources) == 0)) {
+        sources <- list(NULL)
+      } else {
+        # recast for clearer use in functions
+        sources <- list(unlist(sources))
+      }
+    } else {
+      # no sources
+      columns <- column
+      sources <- list(NULL)
+    }
+    return(tibble(column = columns, source = sources))
+  }
+
+  # run the find source columns function
+  aggregator_applied <- aggregator |>
+    dplyr::mutate(
+      cols = purrr::pmap(
+        list(.data$dataset, .data$column, .data$source, .data$regexp),
+        find_source_columns
+      )
+    ) |>
+    dplyr::select(-"column", -"source") |>
+    tidyr::unnest("cols") |>
+    dplyr::filter(!is.na(.data$column)) |>
+    # check for columns from regexps that are already covered by direct use
+    dplyr::mutate(
+      .by = "dataset",
+      regexp_col_only = purrr::map2_lgl(
+        .data$source,
+        .data$regexp,
+        function(source, regexp, non_regexp_sources) {
+          regexp && !any(source %in% non_regexp_sources)
+        },
+        non_regexp_sources = .data$source[!.data$regexp] |>
+          unlist(recursive = TRUE)
+      )
+    ) |>
+    dplyr::filter(!.data$regexp | .data$regexp_col_only)
+
+  # all used columns
+  used_columns <- aggregator_applied |>
+    dplyr::summarize(
+      .by = "dataset",
+      all_columns = list(all_columns[[.data$dataset[1]]]),
+      used_columns = list(.data$source |> unlist(recursive = TRUE) |> unique()),
+      unused_columns = list(setdiff(all_columns[[1]], used_columns[[1]]))
+    )
+  # aggregate value for dataset/column from source
+  aggregate_value <- function(dataset, column, source, cast, func, args) {
+    # generate expressions for sources
+    sources <- purrr::map(source, ~ expr((!!sym(dataset))[[(!!(.x))]]))
+
+    if (!is.na(func)) {
+      # with function
+      args <- c(sources, args)
+      expr <- rlang::expr((!!cast)((!!func)(!!!args)))
+    } else {
+      # without funtion
+      expr <- rlang::expr((!!cast)(!!sources[[1]]))
+    }
+
+    # run with try catch so we can inject some more information
+    value <- tryCatch(
+      rlang::eval_tidy(expr, data = datasets),
+      error = function(cnd) {
+        cli_abort(
+          "encountered problems with {.emph {dataset}${column} = {as_label(expr)}}",
+          parent = cnd
+        )
+      }
+    )
+    return(value)
+  }
+
+  # wrap the value aggregation for a safe default and with try_catch_cnds
+  aggregation_wrapper <- function(
+    dataset,
+    column,
+    source,
+    default,
+    cast,
+    func,
+    args,
+    ...
+  ) {
+    default_expr <- rlang::expr((!!cast)(!!default[[1]]))
+    default_value <- rlang::eval_tidy(default_expr, data = datasets)
+    # any source columns?
+    if (length(source) == 0) {
+      return(list(result = default_value, conditions = NULL))
+    }
+
+    # run safely
+    out <-
+      try_catch_cnds(
+        aggregate_value(dataset, column, source, cast, func, args),
+        error_value = default_value,
+        catch_errors = !ir_get_option("debug")
+      )
+    if (show_problems) {
+      show_cnds(out$conditions)
+    }
+    return(out)
+  }
+
+  # run aggregation
+  aggregator_applied$value <-
+    purrr::pmap(as.list(aggregator_applied), aggregation_wrapper)
+
+  # separate call to simplify stack trace
+  # note: unnest_wider conflates integer()/numeric() with NULL and can NOT be used here
+  aggregator_applied <- aggregator_applied |>
+    dplyr::mutate(
+      result = purrr::map(.data$value, `[[`, 1),
+      conditions = purrr::map(.data$value, `[[`, 2)
+    ) |>
+    dplyr::select(-"value")
+
+  # finalize datasets into tibbles
+  aggregator_summary <-
+    aggregator_applied |>
+    dplyr::filter(!purrr::map_lgl(.data$result, is.null)) |>
+    dplyr::summarize(
+      .by = "dataset",
+      out = list(.data$result |> setNames(.data$column) |> as_tibble())
+    )
+  datasets <- aggregator_summary$out |> setNames(aggregator_summary$dataset)
+
+  # add uidx to each tibble
+  datasets <- datasets |>
+    purrr::map(dplyr::mutate, uidx = !!uidx, .before = 1L)
+
+  problems <-
+    dplyr::bind_rows(
+      conversion_cnds,
+      aggregator_applied$conditions
+    ) |>
+    dplyr::mutate(uidx = !!uidx, .before = 1L)
+
+  # return with problems
+  result <- c(datasets, list(problems = problems))
+  attr(result, "unused_columns ") <- used_columns |>
+    dplyr::select("dataset", "unused_columns") |>
+    tibble::deframe()
+  return(result)
+}
