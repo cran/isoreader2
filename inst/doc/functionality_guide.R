@@ -44,8 +44,8 @@ c(isofiles, isofiles)
 
 ## -----------------------------------------------------------------------------
 # save and reload the read isofiles
-isofiles |> ir_save_isofiles(file.path("tmp_examples", "my_isofiles"))
-reloaded <- ir_load_isofiles(file.path("tmp_examples", "my_isofiles"))
+isofiles |> ir_save_isofiles("tmp_examples/my_isofiles.rds")
+reloaded <- ir_load_isofiles("tmp_examples/my_isofiles.rds")
 
 ## -----------------------------------------------------------------------------
 # aggregate the data
@@ -129,6 +129,20 @@ dataset |>
   ir_filter_for_continuous_flow() |>
   ir_get_metadata(metadata = c("file_name", "type"))
 
+## -----------------------------------------------------------------------------
+# keep only the CO2 masses
+dataset |>
+  ir_filter_masses(44:46) |>
+  ir_get_data(metadata = "file_name", traces = c("species", "mass")) |>
+  distinct()
+
+## -----------------------------------------------------------------------------
+# everything except mass 45
+dataset |>
+  ir_filter_masses(-"45") |>
+  ir_get_data(metadata = "file_name", traces = "mass") |>
+  distinct()
+
 ## ----eval=FALSE---------------------------------------------------------------
 # # save and reload the aggregated data
 # dataset |> ir_save_aggregated_data(file.path("tmp_examples", "my_dataset"))
@@ -152,11 +166,11 @@ dataset |>
   )
 
 ## -----------------------------------------------------------------------------
-dataset |> ir_plot_continuous_flow(facet = file_name)
+dataset |> ir_plot_traces(facet = file_name)
 
 ## -----------------------------------------------------------------------------
 dataset |>
-  ir_plot_continuous_flow(
+  ir_plot_traces(
     species = "CO2",
     facet = file_name,
     time_window.min = c(4.5, 8.5)
@@ -165,7 +179,7 @@ dataset |>
 ## -----------------------------------------------------------------------------
 dataset |>
   ir_calculate_ratios(normalize_ratios = median) |>
-  ir_plot_continuous_flow(
+  ir_plot_traces(
     species = "CO2",
     ratio = "45/44",
     facet = file_name,
@@ -173,9 +187,40 @@ dataset |>
   )
 
 ## -----------------------------------------------------------------------------
+dataset |>
+  ir_calculate_ratios() |>
+  ir_plot_traces(
+    species = "CO2",
+    mass = -"46",
+    facet = file_name,
+    time_window.min = c(4.5, 8.5)
+  )
+
+## -----------------------------------------------------------------------------
+# # ratios have to be calculated before they can be selected
+# with_ratios <- dataset |> ir_calculate_ratios()
+# 
+# # all masses and all available ratios (the default)
+# with_ratios |> ir_plot_traces()
+# # only the ratios, no intensity traces
+# with_ratios |> ir_plot_traces(mass = c())
+# # only the intensity traces, no ratios
+# with_ratios |> ir_plot_traces(ratio = c())
+# # a specific set, as names or (via as.character) as numbers
+# dataset |> ir_plot_traces(mass = c("44", "45"))
+# dataset |> ir_plot_traces(mass = 44:46)
+# # everything except one
+# ir_plot_traces(dataset, mass = -"30")
+# # pattern matching helpers
+# dataset |> ir_plot_traces(mass = starts_with("4"))
+# with_ratios |> ir_plot_traces(mass = c(), ratio = matches("/44"))
+# # tolerate masses/ratios that may not be in the data with any_of (a plain c() would error)
+# dataset |> ir_plot_traces(mass = any_of(c("44", "47")))
+
+## -----------------------------------------------------------------------------
 library(ggplot2)
 dataset |>
-  ir_plot_continuous_flow(
+  ir_plot_traces(
     species = "N2",
     facet = file_name,
     scientific = TRUE
@@ -197,7 +242,12 @@ di_dataset <-
 di_dataset |> ir_plot_dual_inlet(facet = file_name)
 
 ## -----------------------------------------------------------------------------
-di_dataset |> ir_plot_dual_inlet(mass = c(44, 45, 46), facet = file_name)
+di_dataset |>
+  ir_plot_dual_inlet(
+    mass = 44:46,
+    ratio = c("45/44", "46/44"),
+    facet = file_name
+  )
 
 ## -----------------------------------------------------------------------------
 data_folder |>

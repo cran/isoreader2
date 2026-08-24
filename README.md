@@ -5,10 +5,14 @@
 
 <!-- badges: start -->
 
-[![Documentation](https://img.shields.io/badge/docs-online-green.svg)](https://isoreader2.isoverse.org/)
+[![Documentation](https://img.shields.io/badge/docs-online-brightgreen.svg)](https://isoreader2.isoverse.org/)
+[![CRAN_Status_Badge](https://www.r-pkg.org/badges/version/isoreader2)](https://cran.r-project.org/package=isoreader2)
+[![Life
+cycle](https://img.shields.io/badge/lifecycle-stable-brightgreen.svg)](https://lifecycle.r-lib.org/articles/stages.html)
 [![R-CMD-check](https://github.com/isoverse/isoreader2/workflows/R-CMD-check/badge.svg)](https://github.com/isoverse/isoreader2/actions)
 [![Codecov test
 coverage](https://codecov.io/gh/isoverse/isoreader2/graph/badge.svg)](https://app.codecov.io/gh/isoverse/isoreader2)
+[![DOI](https://joss.theoj.org/papers/10.21105/joss.02878/status.svg)](https://doi.org/10.21105/joss.02878)
 <!-- badges: end -->
 
 ## Overview
@@ -41,12 +45,24 @@ file formats:
 
 ## Installation
 
-[isoreader2](https://isoreader2.isoverse.org/) is not yet on the
-Comprehensive R Archive Network (CRAN) but you can install the latest
-version from [GitHub](https://github.com/isoverse/isoreader2) as shown
-below. If you are on Windows, make sure to install the equivalent
-version of [Rtools](https://cran.r-project.org/bin/windows/Rtools/) for
-your version of R (e.g. for the latest R 4.5 and 4.6, use
+You can install the current CRAN version of
+[isoreader2](https://isoreader2.isoverse.org/) with:
+
+``` r
+# install the isoreader2 package
+install.packages("isoreader2")
+# check/install isoextract
+isoreader2::ir_check_isoextract()
+```
+
+### Development version
+
+To use the latest updates, you can install the development version of
+[isoreader2](https://isoreader2.isoverse.org/) from
+[GitHub](https://github.com/isoverse/isoreader2) as shown below. If you
+are on Windows, make sure to install the equivalent version of
+[Rtools](https://cran.r-project.org/bin/windows/Rtools/) for your
+version of R (e.g. for the latest R 4.5 and 4.6, use
 [RTools4.5](https://cran.r-project.org/bin/windows/Rtools/rtools45/rtools.html) -
 you can find out which version you have with `getRversion()` from an R
 console).
@@ -85,7 +101,7 @@ dataset <-
   ir_aggregate_isofiles("mV")
 
 # visualize data for each file
-dataset |> ir_plot_continuous_flow(facet = file_name)
+dataset |> ir_plot_traces(facet = file_name)
 ```
 
 <div class="figure">
@@ -102,7 +118,7 @@ Plot of continuous flow examples
 # visualize CO2 with ratios and a specific time window
 dataset |>
   ir_calculate_ratios(normalize_ratios = median) |>
-  ir_plot_continuous_flow(
+  ir_plot_traces(
     species = "CO2",
     time_window.min = c(4.5, 8.5)
   )
@@ -137,9 +153,9 @@ file_paths <- data_folder |> ir_find_dual_inlet()
 isofiles <- file_paths |> ir_read_isofiles()
 ```
 
-    > ✔ [107ms] ir_extract_isofiles() finished extracting 1 file/archive
+    > ✔ [108ms] ir_extract_isofiles() finished extracting 1 file/archive
 
-    > ✔ [196ms] ir_read_isofiles() finished reading 1 isotope data file/archive
+    > ✔ [164ms] ir_read_isofiles() finished reading 1 isotope data file/archive
 
 ``` r
 # show information about the files
@@ -149,8 +165,7 @@ isofiles
     > ─────── 1 isofile with 1 analysis - process with ir_aggregate_isofiles() ───────
 
     > 1. caf_dual_inlet_example.caf: with 8 sample/standard cycles for CO2clump
-    > (masses 44, 45, 46, 47, 48, 49, 44, 45, 46, 47, 48, 49, 44, 45, 46, 47, 48, 49,
-    > …, 48, and 49); 21 metadata columns
+    > (masses 44, 45, 46, 47, 48, and 49); 21 metadata columns
 
 ### Aggregate the data
 
@@ -185,18 +200,18 @@ dataset
 
 ``` r
 # filter the data by a metadata field and mass range and plot it
-# (use ir_plot_continuous_flow() and ir_plot_scans(), respectively)
+# (use ir_plot_traces() and ir_plot_scans(), respectively)
 library(ggplot2)
 dataset |>
   ir_filter_metadata(file_name == "caf_dual_inlet_example") |>
   ir_calculate_ratios() |>
-  ir_plot_dual_inlet(mass = c(44:48)) +
+  ir_plot_dual_inlet(mass = 44:48, ratio = c("45/44", "46/44")) +
   # use ggplot2 to modify with custom theming (or any other ggplot elements)
   theme(strip.text = element_text(size = 30))
 ```
 
-    > ✔ [4ms] ir_calculate_ratios() calculated 85 ratio and added ratio_name/ratio
-    > columns to cycles
+    > ✔ [14ms] ir_calculate_ratios() calculated 85 ratios and added ratio_name and
+    > ratio columns to the cycles
 
 <div class="figure">
 
@@ -225,8 +240,8 @@ ir_export_to_excel(
     > ✔ [3ms] ir_get_data() retrieved 102 records from the combination of metadata
     > (1) and cycles (102) via uidx and analysis
 
-    > ✔ [202ms] ir_export_to_excel() exported 1 row of metadata and 102 rows of
-    > cycles to 'my_export.xlsx'
+    > ✔ [84ms] ir_export_to_excel() exported 1 row of metadata and 102 rows of cycles
+    > to 'my_export.xlsx'
 
 ### Bonus: explore isofiles interactively
 
@@ -235,7 +250,7 @@ ir_export_to_excel(
 # interactively and generate visualization code from the GUI
 # (use ie_explore_continuous_flow/dual_inlet/scans)
 if (!requireNamespace("isoexplorer", quietly = TRUE)) {
-  pak::pak("isoverse/isoexplorer")
+  install.packages("isoexplorer")
 }
 example_files <- ir_copy_examples() |> ir_find_isofiles() |> ir_read_isofiles()
 example_files |> isoexplorer::ie_explore_continuous_flow()

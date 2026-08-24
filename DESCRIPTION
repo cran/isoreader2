@@ -1,6 +1,6 @@
 Package: isoreader2
 Title: Read Stable Isotope Data Files
-Version: 0.6.1
+Version: 0.7.0
 Authors@R: 
     c(
         person(
@@ -24,16 +24,16 @@ URL: https://isoreader2.isoverse.org/,
 BugReports: https://github.com/isoverse/isoreader2/issues
 Depends: R (>= 4.5.0)
 Imports: ggplot2, tools, utils, methods, stats, rlang (>= 1.1.0), cli
-        (>= 3.6.0), processx, readr, tibble, dplyr, tidyr, purrr,
-        withr, RcppSimdJson, scales, fansi, knitr
+        (>= 3.6.0), lifecycle, processx, readr, tibble, dplyr, tidyr,
+        tidyselect, purrr, withr, RcppSimdJson, scales, fansi, knitr
 Suggests: testthat (>= 3.0.0), vdiffr, arrow, openxlsx, rmarkdown
 VignetteBuilder: knitr
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.0.0
 NeedsCompilation: no
-Packaged: 2026-07-03 17:58:55 UTC; seko0922
+Packaged: 2026-08-23 18:26:31 UTC; seko0922
 Author: Sebastian Kopf [aut, cre] (ORCID:
     <https://orcid.org/0000-0002-2044-0201>)
 Maintainer: Sebastian Kopf <sebastian.kopf@colorado.edu>
 Repository: CRAN
-Date/Publication: 2026-07-10 20:40:02 UTC
+Date/Publication: 2026-08-24 05:20:15 UTC
