@@ -1,6 +1,6 @@
 Package: isoreader2
 Title: Read Stable Isotope Data Files
-Version: 0.7.0
+Version: 0.7.1
 Authors@R: 
     c(
         person(
@@ -31,9 +31,9 @@ VignetteBuilder: knitr
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.0.0
 NeedsCompilation: no
-Packaged: 2026-08-23 18:26:31 UTC; seko0922
+Packaged: 2026-11-08 05:51:07 UTC; seko0922
 Author: Sebastian Kopf [aut, cre] (ORCID:
     <https://orcid.org/0000-0002-2044-0201>)
 Maintainer: Sebastian Kopf <sebastian.kopf@colorado.edu>
 Repository: CRAN
-Date/Publication: 2026-08-24 05:20:15 UTC
+Date/Publication: 2026-11-09 00:10:02 UTC
